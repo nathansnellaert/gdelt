@@ -1,0 +1,13 @@
+[project]
+name = "gdelt"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "psutil>=5.9.0",
+    "boto3",
+    "httpx",
+    "pyarrow",
+    "deltalake>=0.17.0",
+
+    "duckdb",
+]

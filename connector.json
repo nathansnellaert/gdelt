@@ -1,0 +1,64 @@
+{
+  "name": "GDELT Global Events Database",
+  "description": "Global database of society's events, language, and tone. Monitors world's news media from nearly every country in print, broadcast, and web formats.",
+  "source_name": "GDELT Project",
+  "source_logo": "https://www.gdeltproject.org/images/GDELT_logo_500.png",
+  "source_url": "https://www.gdeltproject.org/",
+  "license": "CC BY-NC 4.0",
+  "license_url": "https://www.gdeltproject.org/about.html#termsofuse",
+  "update_frequency": "Daily ingestion from 15-minute source files",
+  "tags": ["news", "events", "geopolitical", "global", "sentiment", "CAMEO", "real-time", "media"],
+  "data_sources": [
+    {
+      "type": "csv",
+      "url": "http://data.gdeltproject.org/gdeltv2/masterfilelist.txt",
+      "format": "Tab-delimited CSV (zipped per 15-minute interval)",
+      "description": "Master list of all GDELT 2.0 data files"
+    },
+    {
+      "type": "csv",
+      "url": "http://gdeltproject.org/data/lookups/CAMEO.eventcodes.txt",
+      "format": "Tab-delimited",
+      "description": "CAMEO event codelists used to denormalize event_code / event_root_code / event_base_code"
+    },
+    {
+      "type": "csv",
+      "url": "http://gdeltproject.org/data/lookups/FIPS.country.txt",
+      "format": "Tab-delimited",
+      "description": "FIPS 10-4 country code labels; combined with a static FIPS to ISO 3166-1 alpha-2 map to denormalize geo country columns"
+    }
+  ],
+  "datasets": [
+    {
+      "id": "gdelt_events",
+      "name": "GDELT Events",
+      "description": "Row-level CAMEO-coded events with denormalized event/quad labels and ISO 3166-1 alpha-2 geo country codes. Primary key: global_event_id.",
+      "time_range": "2015-02-18 to present",
+      "frequency": "15-minute source resolution, daily ingestion"
+    },
+    {
+      "id": "gdelt_events_daily",
+      "name": "GDELT Events - Daily Country Aggregate",
+      "description": "Daily aggregate by action-location country (ISO 3166-1 alpha-2), CAMEO event root, and quad class. Convenience dataset for fast country-level queries.",
+      "time_range": "2015-02-18 to present",
+      "frequency": "Daily"
+    }
+  ],
+  "deliberately_skipped_datasets": [
+    {
+      "id": "mentions",
+      "reason": "Estimated 400-800 GB; exceeds storage budget. Every mention of every event across every source; high volume, low marginal value over events."
+    },
+    {
+      "id": "gkg",
+      "reason": "Estimated 1-3 TB; exceeds storage budget. Global Knowledge Graph with themes/entities/sentiment per article; wide rows, expensive to parse."
+    },
+    {
+      "id": "v1_events_1979_2015",
+      "reason": "GDELT v1 uses a different schema and cadence. v2 (2015-present) covers all real-time use cases; not worth a second code path."
+    }
+  ],
+  "known_gaps": {
+    "2025-06-15 to 2025-07-01": "17-day source outage; files unavailable upstream. Not re-attempted."
+  }
+}

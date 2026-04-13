@@ -1,0 +1,23 @@
+# State (keep prod state for tracking)
+.state/
+!.state/prod/
+
+# Python environment
+.venv/
+__pycache__/
+
+# Development files
+dev/
+dev.py
+
+# Cache and logs
+**/http_cache/
+logs/
+
+# Output data (subsets is published, raw is local cache)
+data/raw/
+
+# Synced from template
+# Output data (synced via R2, not git)
+data/
+data
