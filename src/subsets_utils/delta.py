@@ -10,11 +10,27 @@ from pathlib import Path
 from typing import Union
 import pyarrow as pa
 from deltalake import write_deltalake, DeltaTable, CommitProperties
+try:
+    from deltalake.exceptions import TableNotFoundError
+except ImportError:
+    try:
+        from deltalake import TableNotFoundError  # older deltalake
+    except ImportError:
+        TableNotFoundError = None  # fallback: we'll handle by exception type name
 
 from .config import get_data_dir, is_cloud, get_storage_options, subsets_uri
 from . import debug
 from .io import data_hash
 from .tracking import record_write
+
+
+def _is_table_not_found(exc: Exception) -> bool:
+    """Distinguish 'table does not exist yet' from other Delta errors."""
+    if TableNotFoundError is not None and isinstance(exc, TableNotFoundError):
+        return True
+    # Fallback string match for deltalake versions without a typed exception
+    msg = str(exc).lower()
+    return "not a delta table" in msg or "no such file" in msg or "does not exist" in msg
 
 
 def _run_commit_properties() -> CommitProperties | None:
@@ -271,14 +287,35 @@ def merge(
     uri = _get_uri(name)
     opts = _get_opts()
 
+    # Probe for table existence. If it doesn't exist yet, create it via
+    # write_deltalake. Any OTHER exception must propagate — we must NOT
+    # silently fall back to overwrite mode because that would destroy an
+    # existing table's contents on a transient merge failure.
     try:
-        # Try to merge into existing table
         dt = DeltaTable(uri, storage_options=opts)
+        table_exists = True
+    except Exception as e:
+        if not _is_table_not_found(e):
+            raise
+        table_exists = False
 
+    if not table_exists:
+        write_deltalake(
+            uri,
+            table,
+            mode="overwrite",
+            partition_by=partition_by,
+            storage_options=opts,
+            commit_properties=_run_commit_properties(),
+        )
+        dt = DeltaTable(uri, storage_options=opts)
+        new_count = len(table)
+        version = dt.version()
+        h = data_hash(table)
+        _log_write(name, table, "merge (created)")
+    else:
         # Build merge predicate
         predicate = " AND ".join([f"target.{k} = source.{k}" for k in keys])
-
-        # All columns for update/insert
         updates = {col: f"source.{col}" for col in table.column_names}
 
         dt.merge(
@@ -298,22 +335,6 @@ def merge(
         version = dt.version()
         h = data_hash(result_table)
         _log_write(name, table, f"merge → {new_count:,} total")
-
-    except Exception:
-        # Table doesn't exist, create it
-        write_deltalake(
-            uri,
-            table,
-            mode="overwrite",
-            partition_by=partition_by,
-            storage_options=opts,
-            commit_properties=_run_commit_properties(),
-        )
-        dt = DeltaTable(uri, storage_options=opts)
-        new_count = len(table)
-        version = dt.version()
-        h = data_hash(table)
-        _log_write(name, table, "merge (created)")
 
     record_write(f"subsets/{name}", version=version, hash=h)
     return WriteResult(uri=uri, version=version, hash=h, rows=new_count)

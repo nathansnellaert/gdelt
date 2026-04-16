@@ -18,8 +18,8 @@ Exit code semantics (read by GH Actions workflow):
 - 1  = subprocess error or run.json status="failed" → failure, do not retrigger
 
 Usage:
-    python -m subsets_utils.runner               # fresh run
-    RUN_ID=r-... python -m subsets_utils.runner  # resume specific run
+    python -m subsets_utils.runner                          # fresh run
+    RUN_ID=20260414-101918 python -m subsets_utils.runner   # adopt / resume a specific id
 """
 
 import csv
@@ -33,9 +33,40 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from .config import is_cloud, get_connector_name
-from .r2 import upload_file, upload_bytes, download_bytes
+from .config import is_cloud, get_connector_name, get_data_dir, get_fs, get_bucket_name
 from . import debug
+
+
+# =============================================================================
+# R2 I/O via fsspec — single backend for all cloud operations
+# =============================================================================
+
+def _r2_uri(key: str) -> str:
+    """Build an s3:// URI for a bucket-relative key."""
+    return f"s3://{get_bucket_name()}/{key}"
+
+
+def _r2_upload_bytes(data: bytes, key: str) -> None:
+    uri = _r2_uri(key)
+    fs = get_fs(uri)
+    with fs.open(uri, "wb") as f:
+        f.write(data)
+
+
+def _r2_upload_file(path: str, key: str) -> None:
+    uri = _r2_uri(key)
+    fs = get_fs(uri)
+    fs.put_file(path, uri)
+
+
+def _r2_download_bytes(key: str) -> bytes | None:
+    uri = _r2_uri(key)
+    fs = get_fs(uri)
+    try:
+        with fs.open(uri, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
 
 
 # =============================================================================
@@ -140,7 +171,7 @@ def _hydrate_resume_state(connector: str, run_id: str, log_dir: Path) -> bool:
         return (log_dir / "run.json").exists()
 
     key = f"{_connector_runs_prefix(connector, run_id)}/run.json"
-    data = download_bytes(key)
+    data = _r2_download_bytes(key)
     if data is None:
         return False
 
@@ -319,7 +350,7 @@ def _upload_server_run_manifest(connector: str, run_id: str, log_dir: Path):
     key = f"subsetsv2/runs/{connector}/run_{connector}_{run_id}.json"
     try:
         data = json.dumps(payload, indent=2).encode()
-        upload_bytes(data, key)
+        _r2_upload_bytes(data, key)
         print(f"[runner] Uploaded server run manifest to {key}")
     except Exception as e:
         print(f"[runner] Failed to upload server manifest: {e}")
@@ -345,9 +376,11 @@ def main():
     if is_resume:
         hydrated = _hydrate_resume_state(connector, run_id, log_dir)
 
-    parent_run_id = os.environ.get("PARENT_RUN_ID")
-    if parent_run_id:
-        (log_dir / "run_id").write_text(parent_run_id)
+    # Dev data dir still needs to exist for local scratch writes.
+    # In cloud, raw/state go straight to R2 via fsspec — no hydrate needed.
+    data_dir = Path(get_data_dir())
+    if not is_cloud():
+        data_dir.mkdir(parents=True, exist_ok=True)
 
     # Record invocation start
     invocation_id = "i-" + datetime.now(ZoneInfo("UTC")).strftime("%Y%m%d-%H%M%S")
@@ -450,15 +483,17 @@ def main():
         write_error_log(log_dir, subprocess_exit, output_file)
         debug.log_run_end(status="failed", error=error_msg)
 
-    # Cloud: evacuate logs to R2 under <connector>/runs/<run_id>/
+    # Cloud: raw + state already live in R2 (connectors write direct via
+    # fsspec/s3fs). Only logs need to be evacuated.
     if is_cloud():
+        # Evacuate invocation logs to R2 under <connector>/runs/<run_id>/
         prefix = _connector_runs_prefix(connector, run_id)
         print(f"Uploading logs to R2 under {prefix}/...")
         for log in log_dir.rglob("*"):
             if log.is_file():
                 try:
                     key = f"{prefix}/{log.relative_to(log_dir)}"
-                    upload_file(str(log), key)
+                    _r2_upload_file(str(log), key)
                     print(f"  -> {key}")
                 except Exception as e:
                     print(f"  Failed to upload {log.name}: {e}")

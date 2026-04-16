@@ -33,10 +33,63 @@ def get_run_id() -> str:
 # =============================================================================
 
 def get_data_dir() -> str:
-    """Get data directory for local mode. Raises in cloud mode."""
-    if is_cloud():
-        raise RuntimeError("get_data_dir() should not be called in cloud mode. Use R2 URIs instead.")
-    return os.environ.get('DATA_DIR', 'data')
+    """Root directory for this connector's raw + state files.
+
+    Defaults to `data/dev/` relative to cwd (override with DATA_DIR env
+    var). Symmetric in local and cloud — in cloud, cwd is the GitHub
+    Actions workspace, so this resolves to an ephemeral directory
+    inside the checkout.
+
+    Persistence: the subsets runner bookends each cloud invocation by
+    hydrating `<connector>/data/{raw,state}/*` from R2 before the
+    subprocess starts and flushing local changes back to R2 after it
+    exits (see meta/subsets_utils/runner.py). From a connector's
+    perspective, `get_data_dir()` is just "a directory with your
+    persistent raw + state files" in both modes — use filesystem
+    primitives freely (Path, glob, gzip.open, etc.).
+
+    Subset Delta tables live at `s3://` in cloud regardless — deltalake
+    manages its own storage layer (see `subsets_uri`).
+    """
+    return os.environ.get('DATA_DIR', 'data/dev')
+
+
+# =============================================================================
+# SSD Mirror — read-only reflection of R2 production state
+#
+# The R2 → SSD sync daemon (meta/services/r2_sync.py) keeps this in sync
+# with cloud writes. Dev runs read from here as a fallback when a file
+# isn't yet in the local dev dir, so you don't have to re-download.
+# =============================================================================
+
+_MIRROR_ROOT_DEFAULT = "/Volumes/ExtremeSSD/data-integrations/integrations"
+
+
+def get_mirror_root() -> Path | None:
+    """Root of the SSD mirror (read-only). Returns None if unavailable.
+
+    Override with SUBSETS_MIRROR_ROOT env var. Falls back to None if the
+    path doesn't exist (e.g. SSD not mounted) — callers should handle that
+    gracefully by skipping the fallback.
+    """
+    root = Path(os.environ.get('SUBSETS_MIRROR_ROOT', _MIRROR_ROOT_DEFAULT))
+    return root if root.exists() else None
+
+
+def mirror_raw_path(asset_id: str, ext: str = "parquet") -> Path | None:
+    """Path to a raw asset in the SSD mirror. Returns None if mirror unavailable."""
+    root = get_mirror_root()
+    if root is None:
+        return None
+    return root / get_connector_name() / "data" / "raw" / f"{asset_id}.{ext}"
+
+
+def mirror_state_path(asset: str) -> Path | None:
+    """Path to a state file in the SSD mirror. Returns None if mirror unavailable."""
+    root = get_mirror_root()
+    if root is None:
+        return None
+    return root / get_connector_name() / "data" / "state" / f"{asset}.json"
 
 
 # =============================================================================
@@ -86,6 +139,46 @@ def get_bucket_name() -> str:
 
 
 # =============================================================================
+# fsspec backend — unified I/O over local file: and R2 s3://
+#
+# All raw + state I/O in io.py dispatches through get_fs(uri). For local
+# paths this returns the local filesystem; for s3:// URIs it returns an
+# s3fs filesystem pointed at R2. Connectors never see the difference —
+# they call save_raw_*/load_raw_*/raw_writer, which route through here.
+#
+# Today raw_uri() / state_uri() still return local paths in cloud (the
+# runner bookend hydrates/flushes from R2). When the bookend is removed,
+# those URIs will flip to s3:// and the same io.py code will stream
+# writes directly to R2 via s3fs multipart upload — no code changes in
+# io.py required.
+# =============================================================================
+
+def get_fsspec_storage_options(uri: str) -> dict:
+    """fsspec storage_options for a URI. Empty for local, R2 creds for s3://."""
+    if not uri.startswith("s3://"):
+        return {}
+    return {
+        "endpoint_url": f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
+        "key": os.environ["R2_ACCESS_KEY_ID"],
+        "secret": os.environ["R2_SECRET_ACCESS_KEY"],
+        "client_kwargs": {"region_name": "auto"},
+    }
+
+
+def get_fs(uri: str = ""):
+    """fsspec filesystem for a URI. Protocol-dispatched, cached by fsspec.
+
+    For s3:// URIs returns s3fs pointed at R2 (requires `s3fs` installed).
+    For everything else returns the local filesystem with auto_mkdir so
+    parent dirs are created transparently on open.
+    """
+    import fsspec
+    if uri.startswith("s3://"):
+        return fsspec.filesystem("s3", **get_fsspec_storage_options("s3://"))
+    return fsspec.filesystem("file", auto_mkdir=True)
+
+
+# =============================================================================
 # Path / URI Builders
 #
 # All save/load functions in io.py call these to get a uri (s3:// in cloud,
@@ -104,9 +197,14 @@ def raw_key(asset_id: str, ext: str = "parquet") -> str:
 
 
 def raw_uri(asset_id: str, ext: str = "parquet") -> str:
-    """URI for a raw asset (s3:// in cloud, local path otherwise)."""
+    """URI for a raw asset. s3:// in cloud, local path in dev.
+
+    In cloud, io.py streams writes directly to R2 via s3fs multipart
+    uploads — no disk staging on the runner. In dev, connectors see a
+    plain filesystem path under `data/dev/raw/`.
+    """
     if is_cloud():
-        return f"s3://{get_bucket_name()}/{raw_key(asset_id, ext)}"
+        return f"s3://{get_bucket_name()}/{get_r2_base()}/raw/{asset_id}.{ext}"
     return raw_path(asset_id, ext)
 
 
@@ -116,32 +214,39 @@ def state_key(asset: str) -> str:
 
 
 def state_uri(asset: str) -> str:
-    """URI for a state file (s3:// in cloud, local path otherwise)."""
+    """URI for a state file. s3:// in cloud, local path in dev.
+
+    State writes are direct PUTs in cloud — each `save_state()` call
+    results in one R2 PUT operation. Typical checkpointing connectors
+    make hundreds of these per run; cost is negligible (~$5/month delta
+    across the whole fleet — see cost analysis).
+    """
     if is_cloud():
-        return f"s3://{get_bucket_name()}/{state_key(asset)}"
+        return f"s3://{get_bucket_name()}/{get_r2_base()}/state/{asset}.json"
     return state_path(asset)
 
 
 def subsets_uri(dataset_name: str) -> str:
     """URI for a subsets Delta table (s3:// in cloud, local path otherwise).
 
-    Cloud writes go directly to the server namespace (subsetsv2/datasets/)
-    so the Subsets server can read them without an intermediate sync step.
+    Cloud writes live under the connector's own prefix
+    (<connector>/datasets/<dataset_name>) — the Subsets server poller
+    walks connector roots from the repo, not a global namespace.
     """
     if is_cloud():
-        return f"s3://{get_bucket_name()}/subsetsv2/datasets/{dataset_name}"
+        return f"s3://{get_bucket_name()}/{get_r2_base()}/subsets/{dataset_name}"
     return str(Path(get_data_dir()) / "subsets" / dataset_name)
 
 
 def raw_path(asset_id: str, ext: str = "parquet") -> str:
     """Local path for a raw asset. Creates parent dirs."""
-    path = Path(os.environ.get('DATA_DIR', 'data')) / "raw" / f"{asset_id}.{ext}"
+    path = Path(get_data_dir()) / "raw" / f"{asset_id}.{ext}"
     path.parent.mkdir(parents=True, exist_ok=True)
     return str(path)
 
 
 def state_path(asset: str) -> str:
     """Local path for a state file. Creates parent dirs."""
-    path = Path(os.environ.get('DATA_DIR', 'data')) / "state" / f"{asset}.json"
+    path = Path(get_data_dir()) / "state" / f"{asset}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     return str(path)

@@ -36,7 +36,7 @@ from typing import Callable
 
 from .tracking import (
     set_current_task, get_assets_by_writer, get_reads_by_task,
-    get_asset_version, get_io_records, clear_tracking,
+    get_asset_version, clear_tracking,
 )
 
 
@@ -458,7 +458,6 @@ class DAG:
                 "total_duration_s": sum(
                     n.get("duration_s") or 0 for n in self.state.values()
                 ),
-                "io_trace": get_io_records(),
             },
         }
 
