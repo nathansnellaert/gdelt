@@ -55,7 +55,9 @@ jobs:
 
     - name: Retrigger if continuation needed
       if: steps.connector.outputs.exit_code == '2'
-      run: gh workflow run run.yml
+      run: |
+        gh workflow run run.yml \
+          -f run_id="${{ inputs.run_id }}"
       env:
         GH_TOKEN: ${{ secrets.GH_RETRIGGER_PAT }}
 
