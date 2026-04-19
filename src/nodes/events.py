@@ -15,7 +15,7 @@ import pyarrow.compute as pc
 from subsets_utils import (
     load_state, save_state,
     save_raw_parquet, load_raw_parquet,
-    merge, publish,
+    merge, append, publish,
     raw_asset_exists,
 )
 from subsets_utils.testing import assert_in_range, assert_in_set
@@ -36,9 +36,6 @@ from connector_utils import (
 
 EVENTS_ID = "gdelt_events"
 EVENTS_DAILY_ID = "gdelt_events_daily"
-
-TRANSFORM_BATCH_DAYS = 7
-
 
 def _events_column_descriptions() -> dict[str, str]:
     return {
@@ -276,6 +273,10 @@ def _fetch_day_events(date_str: str, file_list_content: str) -> int:
 def transform_events() -> bool:
     """Cast, denormalize, and publish gdelt_events + gdelt_events_daily.
 
+    Processes one day at a time using append (not merge) to avoid loading the
+    full target partition into memory — critical for a 600M+ row table on a
+    16 GB runner.
+
     Returns True if more work remains (used by orchestrator to re-trigger).
     """
     print("Transforming GDELT events...")
@@ -313,57 +314,41 @@ def transform_events() -> bool:
         return False
 
     print(f"  {len(pending)} days pending transform")
-    batch: list[pa.Table] = []
-    batch_days: list[str] = []
     days_done = 0
 
     for date_str in pending:
         elapsed = time.time() - start_time
         if elapsed >= GH_ACTIONS_MAX_RUN_SECONDS:
-            if batch:
-                _flush_batch(batch, batch_days, processed)
             print(f"\n  Time budget exhausted after {days_done} days ({elapsed/3600:.1f}h)")
             return True
 
         raw = load_raw_parquet(f"events_{date_str}")
         typed = cast_events(raw)
         denormed = denormalize_events(typed, codelists)
-        batch.append(denormed)
-        batch_days.append(date_str)
+
+        _validate_events_batch(denormed)
+
+        print(f"  [{days_done + 1}/{len(pending)}] {date_str}: {denormed.num_rows:,} rows")
+        append(denormed, EVENTS_ID, partition_by=["year"])
+
+        daily = _aggregate_daily(denormed)
+        if daily.num_rows > 0:
+            merge(
+                daily,
+                EVENTS_DAILY_ID,
+                key=["day", "action_geo_country_iso2", "event_root_code", "quad_class"],
+            )
+
+        processed.add(date_str)
+        save_state("gdelt_events_transform", {"processed_days": sorted(processed)})
+
+        del raw, typed, denormed, daily
         days_done += 1
-
-        if len(batch_days) >= TRANSFORM_BATCH_DAYS:
-            _flush_batch(batch, batch_days, processed)
-            batch = []
-            batch_days = []
-
-    if batch:
-        _flush_batch(batch, batch_days, processed)
 
     publish(EVENTS_ID, fit_metadata_for_delta(EVENTS_METADATA))
     publish(EVENTS_DAILY_ID, fit_metadata_for_delta(EVENTS_DAILY_METADATA))
     print(f"\n  Completed! Transformed {days_done} days this run.")
     return False
-
-
-def _flush_batch(batch: list[pa.Table], batch_days: list[str], processed: set[str]) -> None:
-    combined = pa.concat_tables(batch)
-    print(f"  Flushing batch: {len(batch_days)} days, {combined.num_rows:,} rows")
-
-    _validate_events_batch(combined)
-
-    merge(combined, EVENTS_ID, key=["global_event_id"], partition_by=["year"])
-
-    daily = _aggregate_daily(combined)
-    if daily.num_rows > 0:
-        merge(
-            daily,
-            EVENTS_DAILY_ID,
-            key=["day", "action_geo_country_iso2", "event_root_code", "quad_class"],
-        )
-
-    processed.update(batch_days)
-    save_state("gdelt_events_transform", {"processed_days": sorted(processed)})
 
 
 def _validate_events_batch(table: pa.Table) -> None:
