@@ -15,7 +15,7 @@ import pyarrow.compute as pc
 from subsets_utils import (
     load_state, save_state,
     save_raw_parquet, load_raw_parquet,
-    merge, append, publish,
+    merge, publish,
     raw_asset_exists,
 )
 from subsets_utils.testing import assert_in_range, assert_in_set
@@ -273,9 +273,9 @@ def _fetch_day_events(date_str: str, file_list_content: str) -> int:
 def transform_events() -> bool:
     """Cast, denormalize, and publish gdelt_events + gdelt_events_daily.
 
-    Processes one day at a time using append (not merge) to avoid loading the
-    full target partition into memory — critical for a 600M+ row table on a
-    16 GB runner.
+    Partitioned by month_year with month_year in the merge key so Delta only
+    scans the matching month partition (~5M rows) instead of the full table
+    (~600M rows). Processes one ingestion day at a time.
 
     Returns True if more work remains (used by orchestrator to re-trigger).
     """
@@ -329,7 +329,16 @@ def transform_events() -> bool:
         _validate_events_batch(denormed)
 
         print(f"  [{days_done + 1}/{len(pending)}] {date_str}: {denormed.num_rows:,} rows")
-        append(denormed, EVENTS_ID, partition_by=["year"])
+
+        month_years = pc.unique(denormed["month_year"]).to_pylist()
+        for my in month_years:
+            subset = denormed.filter(pc.equal(denormed["month_year"], my))
+            merge(
+                subset,
+                EVENTS_ID,
+                key=["global_event_id", "month_year"],
+                partition_by=["month_year"],
+            )
 
         daily = _aggregate_daily(denormed)
         if daily.num_rows > 0:
