@@ -496,13 +496,19 @@ def load_nodes(nodes_dir: Path | str | None = None) -> DAG:
         print(f"Warning: nodes directory not found: {nodes_dir}")
         return DAG(all_nodes)
 
-    node_files = sorted(nodes_dir.glob("*.py"))
+    top_level = sorted(nodes_dir.glob("*.py"))
+    nested = sorted(
+        f for f in nodes_dir.glob("*/*.py")
+        if f.parent.name != "__pycache__"
+    )
+    node_files = top_level + nested
 
     for node_file in node_files:
         if node_file.name.startswith("_"):
             continue
 
-        module_name = f"nodes.{node_file.stem}"
+        rel = node_file.relative_to(nodes_dir).with_suffix("")
+        module_name = "nodes." + ".".join(rel.parts)
 
         try:
             if module_name in sys.modules:
